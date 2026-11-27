@@ -1,7 +1,9 @@
 package sanex.assistant
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Application
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -20,7 +22,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.vosk.Model
+import kotlin.coroutines.resume
 
 /** Creates the engine as soon as the process starts. Register it as android:name in the manifest. */
 class AssistantApplication : Application() {
@@ -57,11 +61,20 @@ class MutableAssistantState {
     /** Set while mivi-chan is waiting for a spoken yes or no. */
     var confirm            by mutableStateOf<PendingConfirm?>(null)
 
-    /** Non-zero = the overlay should close shortly. Set back to 0 when a new interaction starts. */
+    /** Non-zero = the overlay should close after [closeDelayMs]. Set back to 0 when a new interaction starts. */
     var closeAt            by mutableStateOf(0L)
+    var closeDelayMs       by mutableStateOf(6000L)
 
     var appCommandsEnabled by mutableStateOf(false)
     var keepModelLoaded    by mutableStateOf(true)
+
+    /** Which microphone to use, what is really in use, and what is connected (for settings). */
+    var micChoice          by mutableStateOf(MicChoice.AUTO)
+    var micSource          by mutableStateOf("")
+    var micInfo            by mutableStateOf("")
+
+    /** Whether the assistant may listen over the lock screen without unlocking first. */
+    var allowOnLockScreen  by mutableStateOf(true)
 
     /** Counts finger-downs that reach the overlay window (temporary debugging aid). */
     var debugTaps          by mutableStateOf(0)
@@ -83,10 +96,14 @@ object AssistantEngine {
     private const val KEY_ACTIVE_MODEL = "active_model"
     private const val KEY_APP_COMMANDS = "app_commands"
     private const val KEY_KEEP_MODEL = "keep_model"
+    private const val KEY_MIC = "mic_choice"
+    private const val KEY_LOCK_SCREEN = "lock_screen"
     private const val READY = "準備完了 (Junbi kanryou — Ready)"
     private const val EARCON_DELAY_MS = 250L       // let the start beep finish before the mic opens
+    private const val BLUETOOTH_LEAD_MS = 700L     // time for a Bluetooth headset to switch to its microphone
     private const val UNLOAD_DELAY_MS = 30_000L    // when "keep model in memory" is off
-    private const val CLOSE_DELAY_MS = 2_000L      // overlay stays this long after finishing
+    private const val CLOSE_DELAY_MS = 6_000L      // overlay stays this long after a problem or a cancel
+    private const val CLOSE_AFTER_SUCCESS_MS = 1_500L
 
     lateinit var app: Application
         private set
@@ -97,10 +114,16 @@ object AssistantEngine {
     @Volatile var isOverlayOpen = false
         private set
 
+    /** Set by the overlay: shows the system unlock prompt and reports whether the phone was unlocked. */
+    var unlockHandler: ((done: (Boolean) -> Unit) -> Unit)? = null
+
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var prefs: SharedPreferences
+    @SuppressLint("StaticFieldLeak")
     private lateinit var runner: RoutineRunner
+    @SuppressLint("StaticFieldLeak")
+    private lateinit var audioRoute: AudioRoute
     private var tts: TtsEngine? = null
 
     private var model: Model? = null
@@ -108,9 +131,11 @@ object AssistantEngine {
     private var pendingListen = false
 
     private var listener: VoiceListener? = null
+    private var earconRunnable: Runnable? = null
     private var beginRunnable: Runnable? = null
     private var enrollCallback: ((String) -> Unit)? = null
     private var runJob: Job? = null
+    private var runId = 0
     private var refreshingApps = false
 
     // Spoken yes/no confirmation
@@ -135,9 +160,12 @@ object AssistantEngine {
         initialized = true
         app = application
         prefs = application.getSharedPreferences("Assistant", Context.MODE_PRIVATE)
+        audioRoute = AudioRoute(application)
 
         state.appCommandsEnabled = prefs.getBoolean(KEY_APP_COMMANDS, false)
         state.keepModelLoaded = prefs.getBoolean(KEY_KEEP_MODEL, true)
+        state.micChoice = MicChoice.from(prefs.getString(KEY_MIC, null))
+        state.allowOnLockScreen = prefs.getBoolean(KEY_LOCK_SCREEN, true)
         state.routines.addAll(RoutineStore.load(application))
         state.appAliases.putAll(AppAliasStore.load(application))
         state.activeModelId = preferredModelId()
@@ -156,7 +184,12 @@ object AssistantEngine {
                 }
             }
         }
-        runner = RoutineRunner(application, speak = { tts?.speak(it) }, isSpeaking = { state.isSpeaking })
+        runner = RoutineRunner(
+            application,
+            speak = { tts?.speak(it) },
+            isSpeaking = { state.isSpeaking },
+            ensureUnlocked = { ensureUnlocked() }
+        )
 
         refreshApps()
     }
@@ -165,10 +198,50 @@ object AssistantEngine {
 
     fun hasMicPermission(): Boolean =
         ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
+                PackageManager.PERMISSION_GRANTED
 
     fun onMicPermissionResult(granted: Boolean) {
         state.needsMicPermission = !granted
+    }
+
+    fun hasBluetoothPermission(): Boolean = audioRoute.hasBluetoothPermission()
+
+    fun onBluetoothPermissionResult(granted: Boolean) {
+        Log.d(TAG, "Bluetooth (Nearby devices) permission granted: $granted")
+        refreshMicInfo()
+    }
+
+    // ── Microphone choice ────────────────────────────────────────────────────
+
+    fun setMicChoice(choice: MicChoice) {
+        state.micChoice = choice
+        prefs.edit().putString(KEY_MIC, choice.name).apply()
+    }
+
+    /** What is connected right now, shown in the microphone dialog. */
+    fun refreshMicInfo() {
+        state.micInfo = audioRoute.describeDevices()
+    }
+
+    // ── Lock screen ──────────────────────────────────────────────────────────
+
+    fun setAllowOnLockScreen(allow: Boolean) {
+        state.allowOnLockScreen = allow
+        prefs.edit().putBoolean(KEY_LOCK_SCREEN, allow).apply()
+    }
+
+    fun isDeviceLocked(): Boolean =
+        (app.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
+
+    /** Called before an app is opened: if the phone is locked, show the unlock prompt and wait for it. */
+    private suspend fun ensureUnlocked(): Boolean {
+        if (!isDeviceLocked()) return true
+        val handler = unlockHandler ?: return false
+        state.status = "ロック解除が必要です (Unlock your phone)"
+        speak("ロックを解除してください")
+        return suspendCancellableCoroutine { cont ->
+            handler { ok -> if (cont.isActive) cont.resume(ok) }
+        }
     }
 
     // ── Installed apps ───────────────────────────────────────────────────────
@@ -274,6 +347,7 @@ object AssistantEngine {
         enrollCallback = null
         state.isEnrolling = false
         stopListening()
+        audioRoute.release()          // back to normal Bluetooth sound quality
         if (!state.keepModelLoaded) main.postDelayed(unloadRunnable, UNLOAD_DELAY_MS)
     }
 
@@ -284,8 +358,7 @@ object AssistantEngine {
         enrollCallback = null
         state.isEnrolling = false
         stopSpeaking()
-        runJob?.cancel()
-        state.isRunning = false
+        supersedeRun()
         stopListening()
         startListening()
     }
@@ -329,10 +402,9 @@ object AssistantEngine {
         }
         state.needsMicPermission = false
 
-        state.closeAt = 0L
         stopSpeaking()
-        runJob?.cancel()
-        state.isRunning = false
+        supersedeRun()
+        state.closeAt = 0L
         enrollCallback = enroll
         state.isEnrolling = enroll != null
 
@@ -357,19 +429,43 @@ object AssistantEngine {
             state.heardConfidence = null
             state.matchStatus = ""
         }
+
+        // Which microphone? A Bluetooth headset first needs its call link opened, which takes a moment.
+        var route = audioRoute.resolve(state.micChoice)
+        var lead = 0L
+        if (route.bluetoothDevice != null) {
+            val alreadyOpen = audioRoute.isBluetoothLinkOpen
+            if (audioRoute.acquire(route)) {
+                if (!alreadyOpen) lead = BLUETOOTH_LEAD_MS
+            } else {
+                route = audioRoute.resolve(MicChoice.PHONE)
+            }
+        }
+        state.micSource = route.label
+        val chosenRoute = route
+
         state.isListening = true
         state.status = "聞いています… (Kiite imasu — Listening…)"
 
-        Earcon.start()
-        val runnable = Runnable {
-            beginRunnable = null
-            beginRecording(m)
+        val earcon = Runnable {
+            earconRunnable = null
+            Earcon.start()
         }
-        beginRunnable = runnable
-        main.postDelayed(runnable, EARCON_DELAY_MS)
+        earconRunnable = earcon
+        main.postDelayed(earcon, lead)
+
+        val begin = Runnable {
+            beginRunnable = null
+            beginRecording(m, chosenRoute)
+        }
+        beginRunnable = begin
+        main.postDelayed(begin, lead + EARCON_DELAY_MS)
     }
 
-    private fun beginRecording(m: Model) {
+    private fun beginRecording(m: Model, route: MicRoute) {
+        val device = route.inputDevice
+            ?: if (route.bluetoothDevice != null) audioRoute.findBluetoothInput() else null
+
         val l = VoiceListener(m, object : VoiceListener.Callbacks {
             override fun onLevel(level: Float) {
                 state.micLevel = level
@@ -383,6 +479,10 @@ object AssistantEngine {
 
             override fun onResult(text: String, confidence: Float?) {
                 handleUtterance(text, confidence)
+            }
+
+            override fun onSource(label: String) {
+                state.micSource = label
             }
 
             override fun onTimeout() {
@@ -405,12 +505,14 @@ object AssistantEngine {
                 Earcon.fail()
                 state.status = "エラー: $message"
             }
-        })
+        }, audioSource = route.audioSource, inputDevice = device)
         listener = l
         l.start()
     }
 
     fun stopListening() {
+        earconRunnable?.let { main.removeCallbacks(it) }
+        earconRunnable = null
         beginRunnable?.let { main.removeCallbacks(it) }
         beginRunnable = null
         listener?.stop()
@@ -419,6 +521,7 @@ object AssistantEngine {
         state.micLevel = 0f
         state.partialText = ""
         state.partialRomaji = ""
+        if (!isOverlayOpen) audioRoute.release()      // the overlay keeps the Bluetooth link until it closes
         if (!state.isSpeaking && !state.isRunning && !state.modelLoading) state.status = READY
     }
 
@@ -490,12 +593,13 @@ object AssistantEngine {
                 askConfirm("${spokenName(appGuess)}を開きますか？") { openApp(appGuess) }
             }
             !state.appCommandsEnabled &&
-                CommandMatcher.OPEN_VERB.containsMatchIn(CommandMatcher.normalize(text)) -> {
+                    CommandMatcher.OPEN_VERB.containsMatchIn(CommandMatcher.normalize(text)) -> {
                 state.matchStatus = "「アプリを声で開く」がオフです (Turn on “Open apps by voice” in settings)"
                 Earcon.fail()
                 requestClose()
             }
             else -> {
+                Log.d(TAG, "Nothing matched for '$text'")
                 state.matchStatus = "一致するものがありません (Nothing matched)"
                 Earcon.fail()
                 speak("すみません、わかりませんでした")
@@ -586,7 +690,8 @@ object AssistantEngine {
     }
 
     /** Ask the overlay to close itself in a moment (used when an interaction is finished). */
-    private fun requestClose() {
+    private fun requestClose(delayMs: Long = CLOSE_DELAY_MS) {
+        state.closeDelayMs = delayMs
         state.closeAt = SystemClock.elapsedRealtime()
     }
 
@@ -645,8 +750,16 @@ object AssistantEngine {
         }
     }
 
-    fun runRoutine(routine: Routine) {
+    /** A newer action (or you pressing stop) replaces a running one; the old one must not close the overlay. */
+    private fun supersedeRun() {
+        runId++
         runJob?.cancel()
+        state.isRunning = false
+    }
+
+    fun runRoutine(routine: Routine) {
+        supersedeRun()
+        val id = runId
         runJob = scope.launch {
             state.isRunning = true
             state.status = "実行中… (Running: ${routine.name})"
@@ -658,15 +771,16 @@ object AssistantEngine {
                 ok = result.ok
                 state.status = if (ok) "完了 (Done: ${routine.name})" else "エラー: ${result.message}"
             } finally {
-                state.isRunning = false
-                if (ok) requestClose()
+                if (id == runId) {
+                    state.isRunning = false
+                    requestClose(if (ok) CLOSE_AFTER_SUCCESS_MS else CLOSE_DELAY_MS)
+                }
             }
         }
     }
 
     fun cancelRun() {
-        runJob?.cancel()
-        state.isRunning = false
+        supersedeRun()
         state.status = "停止しました (Stopped)"
     }
 

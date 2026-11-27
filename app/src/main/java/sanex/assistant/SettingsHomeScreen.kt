@@ -6,10 +6,17 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -26,13 +33,17 @@ fun SettingsHomeScreen(
     onOpenRoutines: () -> Unit,
     onOpenAppNames: () -> Unit,
     onToggleAppCommands: (Boolean) -> Unit,
-    onToggleKeepModel: (Boolean) -> Unit
+    onToggleKeepModel: (Boolean) -> Unit,
+    onSelectMic: (MicChoice) -> Unit,
+    onRefreshMicInfo: () -> Unit,
+    onToggleLockScreen: (Boolean) -> Unit
 ) {
     val model = ModelManager.availableModels.find { it.id == state.activeModelId }
     val modelLine = (model?.displayName ?: "未選択 / None selected") +
-        if (state.modelLoading) "  ·  読み込み中… / loading…"
-        else if (state.modelLoaded) "  ·  読み込み済み / loaded"
-        else ""
+            if (state.modelLoading) "  ·  読み込み中… / loading…"
+            else if (state.modelLoaded) "  ·  読み込み済み / loaded"
+            else ""
+    var showMicDialog by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -59,6 +70,14 @@ fun SettingsHomeScreen(
                 onClick = onOpenModels
             )
             SettingRow(
+                title = "マイク / Microphone",
+                subtitle = state.micChoice.label,
+                onClick = {
+                    onRefreshMicInfo()
+                    showMicDialog = true
+                }
+            )
+            SettingRow(
                 title = "ルーティン / Routines",
                 subtitle = "${state.routines.size} 件 / routines",
                 onClick = onOpenRoutines
@@ -75,12 +94,50 @@ fun SettingsHomeScreen(
                 onClick = onOpenAppNames
             )
             SettingToggle(
+                title = "ロック画面で使う / Use on lock screen",
+                subtitle = "On: works over the lock screen, and asks you to unlock before opening an app. " +
+                        "Off: asks you to unlock before it listens.",
+                checked = state.allowOnLockScreen,
+                onCheckedChange = onToggleLockScreen
+            )
+            SettingToggle(
                 title = "モデルを常駐 / Keep model in memory",
                 subtitle = "On: the assistant opens instantly. Off: saves RAM, loads on demand.",
                 checked = state.keepModelLoaded,
                 onCheckedChange = onToggleKeepModel
             )
         }
+    }
+
+    if (showMicDialog) {
+        AlertDialog(
+            onDismissRequest = { showMicDialog = false },
+            confirmButton = { TextButton(onClick = { showMicDialog = false }) { Text("閉じる / Close") } },
+            title = { Text("マイク / Microphone") },
+            text = {
+                Column {
+                    MicChoice.entries.forEach { choice ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectMic(choice) }
+                                .padding(vertical = 6.dp)
+                        ) {
+                            RadioButton(selected = state.micChoice == choice, onClick = null)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(choice.label, fontSize = 14.sp, color = Palette.text)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("いま接続中 / Connected now", fontSize = 12.sp, color = Palette.sub)
+                    Text(state.micInfo, fontSize = 12.sp, color = Palette.accent, lineHeight = 18.sp)
+                }
+            },
+            containerColor = Palette.card,
+            titleContentColor = Palette.text,
+            textContentColor = Palette.text
+        )
     }
 }
 
@@ -143,6 +200,8 @@ fun SettingsHomePreview() {
             activeModelId = "vosk-model-ja-0.22"
             modelLoaded = true
         },
-        onOpenModels = {}, onOpenRoutines = {}, onOpenAppNames = {}, onToggleAppCommands = {}, onToggleKeepModel = {}
+        onOpenModels = {}, onOpenRoutines = {}, onOpenAppNames = {},
+        onToggleAppCommands = {}, onToggleKeepModel = {},
+        onSelectMic = {}, onRefreshMicInfo = {}, onToggleLockScreen = {}
     )
 }

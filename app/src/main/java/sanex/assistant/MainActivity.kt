@@ -1,6 +1,7 @@
 package sanex.assistant
 
 import android.Manifest
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -34,9 +35,17 @@ class NavState(start: Screen) {
  */
 class MainActivity : ComponentActivity() {
 
-    private val requestMic =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            AssistantEngine.onMicPermissionResult(granted)
+    // One request for everything, so Android doesn't cancel the second dialog.
+    private val requestPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            AssistantEngine.onMicPermissionResult(
+                results[Manifest.permission.RECORD_AUDIO] ?: AssistantEngine.hasMicPermission()
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                AssistantEngine.onBluetoothPermissionResult(
+                    results[Manifest.permission.BLUETOOTH_CONNECT] ?: AssistantEngine.hasBluetoothPermission()
+                )
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,7 +53,12 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         AssistantEngine.init(application)
 
-        if (!AssistantEngine.hasMicPermission()) requestMic.launch(Manifest.permission.RECORD_AUDIO)
+        val missing = mutableListOf<String>()
+        if (!AssistantEngine.hasMicPermission()) missing += Manifest.permission.RECORD_AUDIO
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !AssistantEngine.hasBluetoothPermission()) {
+            missing += Manifest.permission.BLUETOOTH_CONNECT      // needed to use a Bluetooth headset's mic
+        }
+        if (missing.isNotEmpty()) requestPermissions.launch(missing.toTypedArray())
 
         val nav = NavState(if (AssistantEngine.hasModelInstalled()) Screen.HOME else Screen.SETUP)
         setContent { AppRoot(nav) }
@@ -80,7 +94,10 @@ fun AppRoot(nav: NavState) {
             onOpenRoutines = { nav.screen = Screen.ROUTINES },
             onOpenAppNames = { nav.screen = Screen.APPS },
             onToggleAppCommands = AssistantEngine::setAppCommandsEnabled,
-            onToggleKeepModel = AssistantEngine::setKeepModelLoaded
+            onToggleKeepModel = AssistantEngine::setKeepModelLoaded,
+            onSelectMic = AssistantEngine::setMicChoice,
+            onRefreshMicInfo = AssistantEngine::refreshMicInfo,
+            onToggleLockScreen = AssistantEngine::setAllowOnLockScreen
         )
         Screen.MODELS -> SettingsScreen(
             activeModelId = state.activeModelId,

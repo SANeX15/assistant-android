@@ -1,9 +1,12 @@
 package sanex.assistant
 
+import android.app.KeyguardManager
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.MotionEvent
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -32,7 +35,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 /** Shows a small "taps: N" line in the overlay so we can see whether touches reach it. Set to false once taps work. */
-private const val SHOW_TOUCH_DEBUG = true
+private const val SHOW_TOUCH_DEBUG = false
 
 /**
  * The assistant overlay: a translucent window with a bottom sheet of at most half the screen.
@@ -43,9 +46,13 @@ class AssistantActivity : ComponentActivity() {
 
     private var launchedVia = "intent"
 
+    /** True while the system unlock prompt is on screen; the overlay must not close itself then. */
+    private var unlocking = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        showOverLockScreen()
 
         launchedVia =
             if (intent.getBooleanExtra(EXTRA_FROM_SESSION, false)) "assistant session"
@@ -53,6 +60,7 @@ class AssistantActivity : ComponentActivity() {
 
         AssistantEngine.init(application)
         AssistantEngine.onOverlayOpened()
+        AssistantEngine.unlockHandler = { done -> requestUnlock(done) }
 
         setContent {
             AssistantOverlay(
@@ -65,7 +73,51 @@ class AssistantActivity : ComponentActivity() {
             )
         }
 
-        if (savedInstanceState == null) AssistantEngine.startListening()
+        if (savedInstanceState == null) startWhenReady()
+    }
+
+    /** Show above the lock screen and light the screen, like Google Assistant did. */
+    private fun showOverLockScreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /** If the phone is locked and "use on lock screen" is off, unlock first; otherwise just start listening. */
+    private fun startWhenReady() {
+        val state = AssistantEngine.state
+        if (AssistantEngine.isDeviceLocked() && !state.allowOnLockScreen) {
+            requestUnlock { ok -> if (ok) AssistantEngine.startListening() else closeOverlay() }
+        } else {
+            AssistantEngine.startListening()
+        }
+    }
+
+    /** Shows the system unlock prompt (fingerprint, PIN...) and reports whether the phone was unlocked. */
+    private fun requestUnlock(done: (Boolean) -> Unit) {
+        val keyguard = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
+        if (!keyguard.isKeyguardLocked) {
+            done(true)
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            done(false)
+            return
+        }
+        unlocking = true
+        keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+            override fun onDismissSucceeded() { unlocking = false; done(true) }
+            override fun onDismissCancelled() { unlocking = false; done(false) }
+            override fun onDismissError() { unlocking = false; done(false) }
+        })
     }
 
     /** The assistant was triggered again (headset button, gesture...) while this screen is already open. */
@@ -94,10 +146,11 @@ class AssistantActivity : ComponentActivity() {
     // (another app was opened, the screen turned off, the user went home).
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) closeOverlay()
+        if (!isChangingConfigurations && !unlocking) closeOverlay()
     }
 
     override fun onDestroy() {
+        AssistantEngine.unlockHandler = null
         if (!isChangingConfigurations) AssistantEngine.onOverlayClosed()
         super.onDestroy()
     }
@@ -145,7 +198,7 @@ fun AssistantOverlay(
     val closeAt = state.closeAt
     LaunchedEffect(closeAt) {
         if (closeAt != 0L) {
-            delay(6000)
+            delay(state.closeDelayMs)
             onDismiss()
         }
     }
@@ -206,6 +259,15 @@ fun AssistantOverlay(
                             .background(accent)
                     )
                 }
+            }
+
+            if (state.micSource.isNotBlank()) {
+                Text(
+                    text = "マイク / Mic: ${state.micSource}",
+                    fontSize = 10.sp,
+                    color = subColor,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
             }
 
             // Result in the middle

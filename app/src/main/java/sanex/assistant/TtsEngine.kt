@@ -1,6 +1,7 @@
 package sanex.assistant
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -18,7 +19,7 @@ class TtsEngine(
     private var ready   = false
     private var pending: String? = null
 
-    private lateinit var tts:TextToSpeech;
+    private var tts:TextToSpeech
 
     init {
         tts = TextToSpeech(context) { status ->
@@ -35,7 +36,12 @@ class TtsEngine(
                 pending?.let { speak(it) }
                 pending = null
             }
-        } else {
+            val audioAttributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            tts.setAudioAttributes(audioAttributes)
+            } else {
             Log.e("Assistant", "TTS init failed (status=$status)")
         }
     }

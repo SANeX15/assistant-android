@@ -20,7 +20,8 @@ fun loadLaunchableApps(context: Context): List<AppInfo> {
 class RoutineRunner(
     private val context: Context,
     private val speak: (String) -> Unit,
-    private val isSpeaking: () -> Boolean
+    private val isSpeaking: () -> Boolean,
+    private val ensureUnlocked: suspend () -> Boolean = { true }
 ) {
     data class Result(val ok: Boolean, val message: String)
 
@@ -36,6 +37,7 @@ class RoutineRunner(
                 }
                 is RoutineAction.Wait -> delay(action.seconds * 1000L)
                 is RoutineAction.OpenApp -> {
+                    if (!ensureUnlocked()) return Result(false, "The phone is locked")
                     val intent = context.packageManager.getLaunchIntentForPackage(action.packageName)
                         ?: return Result(false, "App not found: ${action.label}")
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

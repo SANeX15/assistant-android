@@ -1,14 +1,18 @@
 package sanex.assistant
 
+import android.Manifest
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.ToneGenerator
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.RequiresPermission
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -42,6 +46,8 @@ object Earcon {
 class VoiceListener(
     private val model: Model,
     private val callbacks: Callbacks,
+    private val audioSource: Int = MediaRecorder.AudioSource.VOICE_RECOGNITION,
+    private val inputDevice: AudioDeviceInfo? = null,
     private val noSpeechTimeoutMs: Long = 6_000,
     private val maxDurationMs: Long = 12_000
 ) {
@@ -49,6 +55,7 @@ class VoiceListener(
         fun onLevel(level: Float)                       // 0..1, about 10 times a second
         fun onPartial(text: String)
         fun onResult(text: String, confidence: Float?)  // end of a sentence
+        fun onSource(label: String)                     // which microphone is really being used
         fun onTimeout()                                 // nothing was said
         fun onError(message: String)
     }
@@ -66,6 +73,7 @@ class VoiceListener(
         running = false
     }
 
+    @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     private fun loop() {
         val sampleRate = 16000
         val minBuffer = AudioRecord.getMinBufferSize(
@@ -80,7 +88,7 @@ class VoiceListener(
         var recognizer: Recognizer? = null
         try {
             record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                audioSource,
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -91,6 +99,11 @@ class VoiceListener(
                 return
             }
 
+            if (inputDevice != null) {
+                val accepted = record.setPreferredDevice(inputDevice)
+                Log.d("Assistant", "Preferred input ${inputDevice.productName} (type ${inputDevice.type}): $accepted")
+            }
+
             recognizer = Recognizer(model, sampleRate.toFloat())
             recognizer.setWords(true)            // adds per-word confidence to results
 
@@ -99,6 +112,10 @@ class VoiceListener(
                 postError("The microphone is busy")
                 return
             }
+
+            val routed = record.routedDevice
+            Log.d("Assistant", "Recording from ${routed?.productName} (type ${routed?.type})")
+            postSource(routed?.productName?.toString() ?: "default")
 
             val buffer = ShortArray(sampleRate / 10)      // 100 ms of audio
             val startedAt = SystemClock.elapsedRealtime()
@@ -176,6 +193,7 @@ class VoiceListener(
         }
     }
 
+    private fun postSource(label: String) { main.post { if (running) callbacks.onSource(label) } }
     private fun postLevel(level: Float) { main.post { if (running) callbacks.onLevel(level) } }
     private fun postPartial(text: String) { main.post { if (running) callbacks.onPartial(text) } }
     private fun postResult(text: String, conf: Float?) { main.post { if (running) callbacks.onResult(text, conf) } }
